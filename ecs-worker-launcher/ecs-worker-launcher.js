@@ -50,41 +50,41 @@ exports.handler = function(event, context) {
 
     if(!exports.checkS3SuffixWhitelist(key, config.s3_key_suffix_whitelist)) {
         context.fail('Suffix for key: ' + key + ' is not in the whitelist')
+    } else {
+        // We can now go on. Put the Amazon S3 URL into Amazon SQS and start an Amazon ECS task to process it.
+        async.waterfall([
+                function (next) {
+                    var params = {
+                        MessageBody: JSON.stringify(event),
+                        QueueUrl: config.queue
+                    };
+                    sqs.sendMessage(params, function (err, data) {
+                        if (err) { console.warn('Error while sending message: ' + err); }
+                        else { console.info('Message sent, ID: ' + data.MessageId); }
+                        next(err);
+                    });
+                },
+                function (next) {
+                    // Starts an ECS task to work through the feeds.
+                    var params = {
+                        taskDefinition: config.task,
+                        count: 1,
+                        cluster: config.cluster
+                    };
+                    ecs.runTask(params, function (err, data) {
+                        if (err) { console.warn('error: ', "Error while starting task: " + err); }
+                        else { console.info('Task ' + config.task + ' started: ' + JSON.stringify(data.tasks))}
+                        next(err);
+                    });
+                }
+            ], function (err) {
+                if (err) {
+                    context.fail('An error has occurred: ' + err);
+                }
+                else {
+                    context.succeed('Successfully processed Amazon S3 URL.');
+                }
+            }
+        );
     }
-
-    // We can now go on. Put the Amazon S3 URL into Amazon SQS and start an Amazon ECS task to process it.
-    async.waterfall([
-            function (next) {
-                var params = {
-                    MessageBody: JSON.stringify(event),
-                    QueueUrl: config.queue
-                };
-                sqs.sendMessage(params, function (err, data) {
-                    if (err) { console.warn('Error while sending message: ' + err); }
-                    else { console.info('Message sent, ID: ' + data.MessageId); }
-                    next(err);
-                });
-            },
-            function (next) {
-                // Starts an ECS task to work through the feeds.
-                var params = {
-                    taskDefinition: config.task,
-                    count: 1,
-                    cluster: 'default'
-                };
-                ecs.runTask(params, function (err, data) {
-                    if (err) { console.warn('error: ', "Error while starting task: " + err); }
-                    else { console.info('Task ' + config.task + ' started: ' + JSON.stringify(data.tasks))}
-                    next(err);
-                });
-            }
-        ], function (err) {
-            if (err) {
-                context.fail('An error has occurred: ' + err);
-            }
-            else {
-                context.succeed('Successfully processed Amazon S3 URL.');
-            }
-        }
-    );
 };

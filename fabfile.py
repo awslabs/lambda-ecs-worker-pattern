@@ -39,16 +39,16 @@ from cStringIO import StringIO
 from config import *
 
 # Constants (Application specific)
-BUCKET_POSTFIX = '-pov-ray-bucket'  # Gets put after the unix user ID to create the bucket name.
+BUCKET_POSTFIX = 'pov-ray-bucket'  # Gets put after the unix user ID to create the bucket name.
 SSH_KEY_DIR = os.environ['HOME'] + '/.ssh'
 SQS_QUEUE_NAME = APP_NAME + 'Queue'
-LAMBDA_FUNCTION_NAME = 'ecs-worker-launcher'
+LAMBDA_FUNCTION_NAME = APP_NAME + '-ecs-worker-launcher'
+LAMBDA_FUNCTION_SUBDIR = 'ecs-worker-launcher'
 LAMBDA_FUNCTION_DEPENDENCIES = 'async'
 ECS_TASK_NAME = APP_NAME + 'Task'
 
 # Constants (OS specific)
-USER = os.environ['HOME'].split('/')[-1]
-AWS_BUCKET = USER + BUCKET_POSTFIX
+AWS_BUCKET = APP_NAME + '-' + BUCKET_POSTFIX
 AWS_CONFIG_FILE_NAME = os.environ['HOME'] + '/.aws/config'
 AWS_CREDENTIAL_FILE_NAME = os.environ['HOME'] + '/.aws/credentials'
 
@@ -62,7 +62,7 @@ AWS_CLI_STANDARD_OPTIONS = (
 SSH_USER = 'ec2-user'
 CPU_SHARES = 512  # POV-Ray needs at least half a CPU to work nicely.
 MEMORY = 512
-ZIPFILE_NAME = LAMBDA_FUNCTION_NAME + '.zip'
+ZIPFILE_NAME = LAMBDA_FUNCTION_SUBDIR + '.zip'
 
 BUCKET_PERMISSION_SID = APP_NAME + 'Permission'
 WAIT_TIME = 5  # seconds to allow for eventual consistency to kick in.
@@ -106,12 +106,12 @@ LAMBDA_EXECUTION_ROLE_TRUST_POLICY = {
 }
 
 LAMBDA_FUNCTION_CONFIG = {
-    "s3_key_suffix_whitelist": ['.zip'],  # Only S3 keys with this URL will be accepted.
+    "s3_key_suffix_whitelist": ['.beer'],  # Only S3 keys with this URL will be accepted.
     "queue": '',  # To be filled in with the queue ARN.
     "task": ECS_TASK_NAME
 }
 
-LAMBDA_FUNCTION_CONFIG_PATH = './' + LAMBDA_FUNCTION_NAME + '/config.json'
+LAMBDA_FUNCTION_CONFIG_PATH = './' + LAMBDA_FUNCTION_SUBDIR + '/config.json'
 
 BUCKET_NOTIFICATION_CONFIGURATION = {
     "LambdaFunctionConfigurations": [
@@ -132,9 +132,16 @@ ECS_ROLE_BUCKET_ACCESS_POLICY = {
         {
             "Effect": "Allow",
             "Action": [
-                "s3:ListAllMyBuckets"
+                "s3:ListAllMyBuckets",
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage"
             ],
-            "Resource": "arn:aws:s3:::*"
+            "Resource": [
+                "arn:aws:s3:::*",
+                "arn:aws:sqs:*:*:*",
+                "arn:aws:sqs:*:*:*"
+            ]
+
         },
         {
             "Effect": "Allow",
@@ -249,7 +256,7 @@ POV_RAY_SCENE_FILES = [
 
 def update_dependencies():
     local('pip2 install -r requirements.txt')
-    local('cd ' + LAMBDA_FUNCTION_NAME + '; npm install ' + LAMBDA_FUNCTION_DEPENDENCIES)
+    local('cd ' + LAMBDA_FUNCTION_SUBDIR + '; npm install ' + LAMBDA_FUNCTION_DEPENDENCIES)
 
 
 def get_aws_credentials():
@@ -272,6 +279,7 @@ def dump_lambda_function_configuration():
     print('Writing config for Lambda function...')
     lambda_function_config = LAMBDA_FUNCTION_CONFIG.copy()
     lambda_function_config['queue'] = get_queue_url()
+    lambda_function_config['cluster'] = ECS_CLUSTER
     with open(LAMBDA_FUNCTION_CONFIG_PATH, 'w') as fp:
         fp.write(json.dumps(lambda_function_config))
 
@@ -280,7 +288,7 @@ def create_lambda_deployment_package():
     print('Creating ZIP file: ' + ZIPFILE_NAME + '...')
     with ZipFile(ZIPFILE_NAME, 'w', ZIP_DEFLATED) as z:
         saved_dir = os.getcwd()
-        os.chdir(LAMBDA_FUNCTION_NAME)
+        os.chdir(LAMBDA_FUNCTION_SUBDIR)
         for root, dirs, files in os.walk('.'):
             for basename in files:
                 filename = os.path.join(root, basename)
@@ -385,7 +393,7 @@ def update_lambda_function():
         '    --function-name ' + LAMBDA_FUNCTION_NAME +
         '    --zip-file fileb://./' + ZIPFILE_NAME +
         '    --role ' + role_arn +
-        '    --handler ' + LAMBDA_FUNCTION_NAME + '.handler' +
+        '    --handler ' + LAMBDA_FUNCTION_SUBDIR + '.handler' +
         '    --runtime nodejs' +
         AWS_CLI_STANDARD_OPTIONS,
         capture=True
@@ -411,6 +419,7 @@ def get_s3_connection():
 def get_or_create_bucket():
     s3 = get_s3_connection()
     b = s3.lookup(AWS_BUCKET)
+    print b
     if b is None:
         print('Creating bucket: ' + AWS_BUCKET + ' in region: ' + AWS_REGION + '...')
         LOCATION = AWS_REGION if AWS_REGION != 'us-east-1' else ''
@@ -555,7 +564,7 @@ def get_container_instances():
     result = json.loads(local(
         'aws ecs list-container-instances' +
         '    --query containerInstanceArns' +
-        '    --cluster ' + ECS_CLUSTER + 
+        '    --cluster ' + ECS_CLUSTER +
         AWS_CLI_STANDARD_OPTIONS,
         capture=True
     ))
@@ -588,7 +597,6 @@ def prepare_env():
     env.user = SSH_USER
     env.key_filename = SSH_KEY_DIR + '/' + SSH_KEY_NAME
 
-
 def generate_dockerfile():
     return DOCKERFILE % {'name': FULL_NAME_AND_EMAIL, 'worker_file': WORKER_FILE}
 
@@ -615,6 +623,7 @@ def update_ecs_image():
         login_str = local('aws ecr get-login', capture=True)
         print(login_str)
         run('%s' % login_str)
+        run('docker images')
         run('docker push ' + DOCKERHUB_TAG)
 
     # Cleanup.
@@ -638,7 +647,6 @@ def show_task_definition():
 
 def update_ecs_task_definition():
     task_definition_string = json.dumps(generate_task_definition())
-
     local(
         'aws ecs register-task-definition' +
         '    --family ' + ECS_TASK_NAME +
